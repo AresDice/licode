@@ -1,219 +1,122 @@
-/*global window, console, RTCSessionDescription, RoapConnection, webkitRTCPeerConnection*/
+import BaseStack from './BaseStack';
+import SdpHelpers from './../utils/SdpHelpers';
+import Logger from '../utils/Logger';
 
-var Erizo = Erizo || {};
+const ChromeStableStack = (specInput) => {
+  Logger.info('Starting Chrome stable stack', specInput);
+  const spec = specInput;
+  const that = BaseStack(specInput);
+  const defaultSimulcastSpatialLayers = 2;
+  that.mediaConstraints = {
+    offerToReceiveVideo: true,
+    offerToReceiveAudio: true,
+  };
 
-Erizo.ChromeStableStack = function (spec) {
-    "use strict";
+  that.enableSimulcast = (sdpInput) => {
+    let result;
+    let sdp = sdpInput;
+    if (!that.simulcast) {
+      return sdp;
+    }
+    const hasAlreadySetSimulcast = sdp.match(new RegExp('a=ssrc-group:SIM', 'g')) !== null;
+    if (hasAlreadySetSimulcast) {
+      return sdp;
+    }
+    // TODO(javier): Improve the way we check for current video ssrcs
+    const matchGroup = sdp.match(/a=ssrc-group:FID ([0-9]*) ([0-9]*)\r?\n/);
+    if (!matchGroup || (matchGroup.length <= 0)) {
+      return sdp;
+    }
+    // TODO (pedro): Consider adding these to SdpHelpers
+    const numSpatialLayers = that.simulcast.numSpatialLayers || defaultSimulcastSpatialLayers;
+    const baseSsrc = parseInt(matchGroup[1], 10);
+    const baseSsrcRtx = parseInt(matchGroup[2], 10);
+    const cname = sdp.match(new RegExp(`a=ssrc:${matchGroup[1]} cname:(.*)\r?\n`))[1];
+    const msid = sdp.match(new RegExp(`a=ssrc:${matchGroup[1]} msid:(.*)\r?\n`))[1];
+    const mslabel = sdp.match(new RegExp(`a=ssrc:${matchGroup[1]} mslabel:(.*)\r?\n`))[1];
+    const label = sdp.match(new RegExp(`a=ssrc:${matchGroup[1]} label:(.*)\r?\n`))[1];
 
-    var that = {},
-        WebkitRTCPeerConnection = webkitRTCPeerConnection;
+    sdp.match(new RegExp(`a=ssrc:${matchGroup[1]}.*\r?\n`, 'g')).forEach((line) => {
+      sdp = sdp.replace(line, '');
+    });
+    sdp.match(new RegExp(`a=ssrc:${matchGroup[2]}.*\r?\n`, 'g')).forEach((line) => {
+      sdp = sdp.replace(line, '');
+    });
 
-    that.pc_config = {
-        "iceServers": []
-    };
+    const spatialLayers = [baseSsrc];
+    const spatialLayersRtx = [baseSsrcRtx];
 
-
-    that.con = {'optional': [{'DtlsSrtpKeyAgreement': true}]};
-
-    if (spec.stunServerUrl !== undefined) {
-        that.pc_config.iceServers.push({"url": spec.stunServerUrl});
-    } 
-
-    if ((spec.turnServer || {}).url) {
-        that.pc_config.iceServers.push({"username": spec.turnServer.username, "credential": spec.turnServer.password, "url": spec.turnServer.url});
+    for (let i = 1; i < numSpatialLayers; i += 1) {
+      spatialLayers.push(baseSsrc + (i * 1000));
+      spatialLayersRtx.push(baseSsrcRtx + (i * 1000));
     }
 
-    if (spec.audio === undefined) {
-        spec.audio = true;
+    result = SdpHelpers.addSim(spatialLayers);
+    let spatialLayerId;
+    let spatialLayerIdRtx;
+    for (let i = 0; i < spatialLayers.length; i += 1) {
+      spatialLayerId = spatialLayers[i];
+      spatialLayerIdRtx = spatialLayersRtx[i];
+      result += SdpHelpers.addGroup(spatialLayerId, spatialLayerIdRtx);
     }
 
-    if (spec.video === undefined) {
-        spec.video = true;
+    for (let i = 0; i < spatialLayers.length; i += 1) {
+      spatialLayerId = spatialLayers[i];
+      spatialLayerIdRtx = spatialLayersRtx[i];
+      result += SdpHelpers.addSpatialLayer(cname,
+        msid, mslabel, label, spatialLayerId, spatialLayerIdRtx);
     }
+    result += 'a=x-google-flag:conference\r\n';
+    return sdp.replace(matchGroup[0], result);
+  };
 
-    that.mediaConstraints = {
-        mandatory : {
-            'OfferToReceiveVideo': spec.video,
-            'OfferToReceiveAudio': spec.audio
-        }
-    };
-    
-    var errorCallback = function(message){
-      console.log("Error in Stack ", message);
+  const setBitrateForVideoLayers = (sender) => {
+    if (typeof sender.getParameters !== 'function' || typeof sender.setParameters !== 'function') {
+      Logger.warning('Cannot set simulcast layers bitrate: getParameters or setParameters is not available');
+      return;
     }
-
-    that.peerConnection = new WebkitRTCPeerConnection(that.pc_config, that.con);
-    
-    var setMaxBW = function (sdp) {
-        if (spec.video && spec.maxVideoBW) {
-            var a = sdp.match(/m=video.*\r\n/);
-            if (a == null){
-              a = sdp.match(/m=video.*\n/);
-            }
-            var r = a[0] + "b=AS:" + spec.maxVideoBW + "\r\n";
-            sdp = sdp.replace(a[0], r);
-        }
-
-        if (spec.audio && spec.maxAudioBW) {
-            var a = sdp.match(/m=audio.*\r\n/);
-            if (a == null){
-              a = sdp.match(/m=audio.*\n/);
-            }
-            var r = a[0] + "b=AS:" + spec.maxAudioBW + "\r\n";
-            sdp = sdp.replace(a[0], r);
-        }
-
-        return sdp;
-    };
-
-    /**
-     * Closes the connection.
-     */
-    that.close = function () {
-        that.state = 'closed';
-        that.peerConnection.close();
-    };
-
-    spec.localCandidates = [];
-
-    that.peerConnection.onicecandidate =  function (event) {
-        if (event.candidate) {
-
-            if (!event.candidate.candidate.match(/a=/)) {
-                event.candidate.candidate ="a="+event.candidate.candidate;
-            };
-
-            var candidateObject = {
-                sdpMLineIndex: event.candidate.sdpMLineIndex,
-                sdpMid: event.candidate.sdpMid,
-                candidate: event.candidate.candidate
-            };
-
-            if (spec.remoteDescriptionSet) {
-                spec.callback({type:'candidate', candidate: candidateObject});
-            } else {
-                spec.localCandidates.push(candidateObject);
-                console.log("Local Candidates stored: ", spec.localCandidates.length, spec.localCandidates);
-            }
-
-        } else {
-            console.log("End of candidates.");
-        }
-    };
-
-    that.peerConnection.onaddstream = function (stream) {
-        if (that.onaddstream) {
-            that.onaddstream(stream);
-        }
-    };
-
-    that.peerConnection.onremovestream = function (stream) {
-        if (that.onremovestream) {
-            that.onremovestream(stream);
-        }
-    };
-
-    var localDesc;
-
-    var setLocalDesc = function (sessionDescription) {
-        sessionDescription.sdp = setMaxBW(sessionDescription.sdp);
-        sessionDescription.sdp = sessionDescription.sdp.replace(/a=ice-options:google-ice\r\n/g, "");
-        spec.callback({
-            type: sessionDescription.type,
-            sdp: sessionDescription.sdp
-        });
-        localDesc = sessionDescription;
-        //that.peerConnection.setLocalDescription(sessionDescription);
-    }
-
-    var setLocalDescp2p = function (sessionDescription) {
-        sessionDescription.sdp = setMaxBW(sessionDescription.sdp);
-        sessionDescription.sdp = sessionDescription.sdp.replace(/a=ice-options:google-ice\r\n/g, "");
-        spec.callback({
-            type: sessionDescription.type,
-            sdp: sessionDescription.sdp
-        });
-        localDesc = sessionDescription;
-        that.peerConnection.setLocalDescription(sessionDescription);
-    }
-
-    that.createOffer = function (isSubscribe) {
-      if (isSubscribe===true){
-          that.peerConnection.createOffer(setLocalDesc, errorCallback, that.mediaConstraints);
-      }else{
-          that.peerConnection.createOffer(setLocalDesc, errorCallback);
+    const parameters = sender.getParameters();
+    Object.keys(that.simulcast.spatialLayerBitrates).forEach((key) => {
+      if (parameters.encodings[key] !== undefined) {
+        Logger.debug(`Setting bitrate for layer ${key}, bps: ${that.simulcast.spatialLayerBitrates[key]}`);
+        parameters.encodings[key].maxBitrate = that.simulcast.spatialLayerBitrates[key];
       }
+    });
+    sender.setParameters(parameters)
+      .then((result) => {
+        Logger.debug('Success setting simulcast layer bitrates', result);
+      })
+      .catch((e) => {
+        Logger.warning('Error setting simulcast layer bitrates', e);
+      });
+  };
 
-    };
-
-    that.addStream = function (stream) {
-        that.peerConnection.addStream(stream);
-    };
-    spec.remoteCandidates = [];
-
-    spec.remoteDescriptionSet = false;
-
-    that.processSignalingMessage = function (msg) {
-        //console.log("Process Signaling Message", msg);
-
-        if (msg.type === 'offer') {
-            msg.sdp = setMaxBW(msg.sdp);
-            that.peerConnection.setRemoteDescription(new RTCSessionDescription(msg));
-            that.peerConnection.createAnswer(setLocalDescp2p, null, that.mediaConstraints);
-            spec.remoteDescriptionSet = true;
-        
-        } else if (msg.type === 'answer') {
-
-
-            // // For compatibility with only audio in Firefox Revisar
-            // if (answer.match(/a=ssrc:55543/)) {
-            //     answer = answer.replace(/a=sendrecv\\r\\na=mid:video/, 'a=recvonly\\r\\na=mid:video');
-            //     answer = answer.split('a=ssrc:55543')[0] + '"}';
-            // }
-
-            console.log("Set remote and local description", msg.sdp);
-
-            msg.sdp = setMaxBW(msg.sdp);
-
-            that.peerConnection.setLocalDescription(localDesc, function(){
-              that.peerConnection.setRemoteDescription(new RTCSessionDescription(msg), function() {
-                spec.remoteDescriptionSet = true;
-                console.log("Candidates to be added: ", spec.remoteCandidates.length, spec.remoteCandidates);
-                while (spec.remoteCandidates.length > 0) {
-                // IMPORTANT: preserve ordering of candidates
-                  that.peerConnection.addIceCandidate(spec.remoteCandidates.shift());
-                }
-                console.log("Local candidates to send:" , spec.localCandidates.length);
-                while(spec.localCandidates.length > 0) {
-                // IMPORTANT: preserve ordering of candidates
-                  spec.callback({type:'candidate', candidate: spec.localCandidates.shift()});
-                }
-
-              });
-            });
-
-        } else if (msg.type === 'candidate') {
-            try {
-                var obj;
-                if (typeof(msg.candidate) === 'object') {
-                    obj = msg.candidate;
-                } else {
-                    obj = JSON.parse(msg.candidate);
-                }
-                obj.candidate = obj.candidate.replace(/a=/g, "");
-                obj.sdpMLineIndex = parseInt(obj.sdpMLineIndex);
-                var candidate = new RTCIceCandidate(obj);
-                if (spec.remoteDescriptionSet) {
-                    that.peerConnection.addIceCandidate(candidate);
-                } else {
-                    spec.remoteCandidates.push(candidate);
-//                    console.log("Candidates stored: ", spec.remoteCandidates.length, spec.remoteCandidates);
-                }
-            } catch(e) {
-                L.Logger.error("Error parsing candidate", msg.candidate);
-            }
+  that.setSimulcastLayersBitrate = () => {
+    Logger.debug('Maybe set simulcast Layers bitrate', that.simulcast);
+    if (that.simulcast && that.simulcast.spatialLayerBitrates) {
+      that.peerConnection.getSenders().forEach((sender) => {
+        if (sender.track.kind === 'video') {
+          setBitrateForVideoLayers(sender);
         }
+      });
     }
+  };
 
-    return that;
+  that.setStartVideoBW = (sdpInfo) => {
+    if (that.video && spec.startVideoBW) {
+      Logger.debug(`startVideoBW requested: ${spec.startVideoBW}`);
+      SdpHelpers.setParamForCodecs(sdpInfo, 'video', 'x-google-start-bitrate', spec.startVideoBW);
+    }
+  };
+
+  that.setHardMinVideoBW = (sdpInfo) => {
+    if (that.video && spec.hardMinVideoBW) {
+      Logger.debug(`hardMinVideoBW requested: ${spec.hardMinVideoBW}`);
+      SdpHelpers.setParamForCodecs(sdpInfo, 'video', 'x-google-min-bitrate', spec.hardMinVideoBW);
+    }
+  };
+
+  return that;
 };
+
+export default ChromeStableStack;

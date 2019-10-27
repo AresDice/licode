@@ -1,329 +1,676 @@
-/*global require, exports, , setInterval, clearInterval*/
+/* global require, exports, setInterval, clearInterval, Promise */
 
-var addon = require('./../../erizoAPI/build/Release/addon');
-var logger = require('./../common/logger').logger;
-var amqper = require('./../common/amqper');
+
+const logger = require('./../common/logger').logger;
+const amqper = require('./../common/amqper');
+const RovReplManager = require('./../common/ROV/rovReplManager').RovReplManager;
+const Client = require('./models/Client').Client;
+const Publisher = require('./models/Publisher').Publisher;
+const ExternalInput = require('./models/Publisher').ExternalInput;
 
 // Logger
-var log = logger.getLogger("ErizoJSController");
+const log = logger.getLogger('ErizoJSController');
 
-exports.ErizoJSController = function (spec) {
-    "use strict";
+exports.ErizoJSController = (erizoJSId, threadPool, ioThreadPool) => {
+  const that = {};
+  // {streamId1: Publisher, streamId2: Publisher}
+  const publishers = {};
+  // {clientId: Client}
+  const clients = new Map();
+  const replManager = new RovReplManager(that);
+  const io = ioThreadPool;
+  // {streamId: {timeout: timeout, interval: interval}}
+  const statsSubscriptions = {};
+  const WARN_NOT_FOUND = 404;
+  const WARN_CONFLICT = 409;
 
-    var that = {},
-        // {id: {subsId1: wrtc1, subsId2: wrtc2}}
-        subscribers = {},
-        // {id: {muxer: OneToManyProcessor, wrtc: WebRtcConnection}
-        publishers = {},
+  const MAX_INACTIVE_UPTIME = global.config.erizo.activeUptimeLimit * 24 * 60 * 60 * 1000;
+  const MAX_TIME_SINCE_LAST_OP =
+    global.config.erizo.maxTimeSinceLastOperation * 60 * 60 * 1000;
 
-        // {id: ExternalOutput}
-        externalOutputs = {},
+  const uptimeStats = {
+    startTime: 0,
+    lastOperation: 0,
+  };
 
-        INTERVAL_TIME_SDP = 100,
-        INTERVAL_TIME_KILL = 30*60*1000, // Timeout to kill itself after a timeout since the publisher leaves room.
-        INTERVAL_STATS = 3000,
-        initWebRtcConnection,
-        getSdp,
-        getRoap;
+  const checkUptimeStats = () => {
+    const now = new Date();
+    const timeSinceStart = now.getTime() - uptimeStats.startTime.getTime();
+    const timeSinceLastOperation = now.getTime() - uptimeStats.lastOperation.getTime();
+    log.debug(`Checking uptime - timeSinceStart: ${timeSinceStart}, timeSinceLastOperation ${timeSinceLastOperation}, max since start ${MAX_INACTIVE_UPTIME}, max since opf ${MAX_TIME_SINCE_LAST_OP}`);
+    if (timeSinceStart > MAX_INACTIVE_UPTIME &&
+      timeSinceLastOperation > MAX_TIME_SINCE_LAST_OP) {
+      log.error(`Shutting down ErizoJS - uptime: ${timeSinceStart}, timeSinceLastOperation ${timeSinceLastOperation}`);
+      process.exit(0);
+    }
+  };
 
+  const updateUptimeInfo = () => {
+    uptimeStats.lastOperation = new Date();
+    if (uptimeStats.startTime === 0) {
+      log.info('Start checking uptime, interval', global.config.erizo.checkUptimeInterval);
+      uptimeStats.startTime = new Date();
+      setInterval(checkUptimeStats, global.config.erizo.checkUptimeInterval * 1000);
+    }
+  };
 
-    var CONN_INITIAL = 101, CONN_STARTED = 102,CONN_GATHERED = 103, CONN_READY = 104, CONN_FINISHED = 105, CONN_CANDIDATE = 201, CONN_SDP = 202, CONN_FAILED = 500;
-
-
-
-    /*
-     * Given a WebRtcConnection waits for the state CANDIDATES_GATHERED for set remote SDP.
-     */
-    initWebRtcConnection = function (wrtc, callback, id_pub, id_sub, browser) {
-
-        if (GLOBAL.config.erizoController.report.rtcp_stats) {
-          var intervalId = setInterval(function () {
-            var newStats = wrtc.getStats();
-            if (newStats == null){
-              console.log("Stopping stats");
-              clearInterval(intervalId);
-            }
-           // console.log("new STATS ", newStats);
-            var timeStamp = new Date();
-            amqper.broadcast('stats', {pub: id_pub, subs: id_sub, stats: JSON.parse(newStats), timestamp:timeStamp.getTime()});
-          }, INTERVAL_STATS);
-          /*
-            wrtc.getStats(function (newStats){
-                var timeStamp = new Date();
-                amqper.broadcast('stats', {pub: id_pub, subs: id_sub, stats: JSON.parse(newStats), timestamp:timeStamp.getTime()});
-            });
-            */
-        }
-
-        wrtc.init( function (newStatus, mess){
-            log.info("webrtc Addon status ", newStatus, mess, "id pub", id_pub, "id_sub", id_sub );
-
-            if (GLOBAL.config.erizoController.report.connection_events) {
-                var timeStamp = new Date();
-                amqper.broadcast('event', {pub: id_pub, subs: id_sub, type: 'connection_status', status: newStatus, timestamp:timeStamp.getTime()});
-            }
-
-            switch(newStatus) {
-                case CONN_INITIAL:
-                    callback('callback', {type: 'started'});
-                    break;
-
-                case CONN_SDP:
-                case CONN_GATHERED:
-//                    log.debug('Sending SDP', mess);
-                    mess = mess.replace(that.privateRegexp, that.publicIP);
-                    callback('callback', {type: 'answer', sdp: mess});
-                    break;
-                    
-                case CONN_CANDIDATE:
-                    mess = mess.replace(that.privateRegexp, that.publicIP);
-                    callback('callback', {type: 'candidate', candidate: mess});
-                    break;
-
-                case CONN_FAILED:
-                    callback('callback', {type: 'failed'});
-                    break;
-
-                case CONN_READY:
-                    // If I'm a subscriber and I'm bowser, I ask for a PLI
-                    if (id_sub && browser === 'bowser') {
-                        log.info('SENDING PLI from ', id_pub, ' to BOWSER ', id_sub);
-                        publishers[id_pub].wrtc.generatePLIPacket();
-                    }
-                    callback('callback', {type: 'ready'});
-                    break;
-            }
-        });
-        log.info("initializing");
-
-        callback('callback', {type: 'initializing'});
+  const initMetrics = () => {
+    that.metrics = {
+      connectionsFailed: 0,
     };
+  };
 
-    /*
-     * Gets SDP from roap message.
-     */
-    getSdp = function (roap) {
 
-        var reg1 = new RegExp(/^.*sdp\":\"(.*)\",.*$/),
-            sdp = roap.match(reg1)[1],
-            reg2 = new RegExp(/\\r\\n/g);
+  that.publishers = publishers;
+  that.ioThreadPool = io;
+  initMetrics();
 
-        sdp = sdp.replace(reg2, '\n');
+  const forEachPublisher = (action) => {
+    const publisherStreamIds = Object.keys(publishers);
+    for (let i = 0; i < publisherStreamIds.length; i += 1) {
+      action(publisherStreamIds[i], publishers[publisherStreamIds[i]]);
+    }
+  };
 
-        return sdp;
+  const onAdaptSchemeNotify = (callbackRpc, type, message) => {
+    callbackRpc(type, message);
+  };
 
-    };
+  const onPeriodicStats = (clientId, streamId, newStats) => {
+    const timeStamp = new Date();
+    amqper.broadcast('stats', { pub: streamId,
+      subs: clientId,
+      stats: JSON.parse(newStats),
+      timestamp: timeStamp.getTime() });
+  };
 
-    /*
-     * Gets roap message from SDP.
-     */
-    getRoap = function (sdp, offerRoap) {
+  const onConnectionStatusEvent = (erizoControllerId, clientId,
+      connectionId, connectionEvent, newStatus) => {
+    const rpcID = `erizoController_${erizoControllerId}`;
+    amqper.callRpc(rpcID, 'connectionStatusEvent', [clientId, connectionId, newStatus, connectionEvent]);
 
-        var reg1 = new RegExp(/\n/g),
-            offererSessionId = offerRoap.match(/("offererSessionId":)(.+?)(,)/)[0],
-            answererSessionId = "106",
-            answer = ('\n{\n \"messageType\":\"ANSWER\",\n');
+    if (connectionEvent.type === 'failed') {
+      that.metrics.connectionsFailed += 1;
+    }
+  };
 
-        sdp = sdp.replace(reg1, '\\r\\n');
+  const getOrCreateClient = (erizoControllerId, clientId, singlePC = false) => {
+    let client = clients.get(clientId);
+    if (client === undefined) {
+      client = new Client(erizoControllerId, erizoJSId, clientId,
+        threadPool, ioThreadPool, !!singlePC);
+      client.on('status_event', onConnectionStatusEvent.bind(this));
+      clients.set(clientId, client);
+    }
+    return client;
+  };
 
-        //var reg2 = new RegExp(/^.*offererSessionId\":(...).*$/);
-        //var offererSessionId = offerRoap.match(reg2)[1];
+  const closeNode = (node, sendOffer) => {
+    const clientId = node.clientId;
+    const connection = node.connection;
+    log.debug(`message: closeNode, clientId: ${node.clientId}, streamId: ${node.streamId}`);
 
-        answer += ' \"sdp\":\"' + sdp + '\",\n';
-        //answer += ' \"offererSessionId\":' + offererSessionId + ',\n';
-        answer += ' ' + offererSessionId + '\n';
-        answer += ' \"answererSessionId\":' + answererSessionId + ',\n \"seq\" : 1\n}\n';
+    const closePromise = node.close(sendOffer);
 
-        return answer;
-    };
-
-    that.addExternalInput = function (from, url, callback) {
-
-        if (publishers[from] === undefined) {
-
-            log.info("Adding external input peer_id ", from);
-
-            var muxer = new addon.OneToManyProcessor(),
-                ei = new addon.ExternalInput(url);
-
-            publishers[from] = {muxer: muxer};
-            subscribers[from] = {};
-
-            ei.setAudioReceiver(muxer);
-            ei.setVideoReceiver(muxer);
-            muxer.setExternalPublisher(ei);
-
-            var answer = ei.init();
-
-            if (answer >= 0) {
-                callback('callback', 'success');
-            } else {
-                callback('callback', answer);
-            }
-
-        } else {
-            log.info("Publisher already set for", from);
-        }
-    };
-
-    that.addExternalOutput = function (to, url) {
-        if (publishers[to] !== undefined) {
-            log.info("Adding ExternalOutput to " + to + " url " + url);
-            var externalOutput = new addon.ExternalOutput(url);
-            externalOutput.init();
-            publishers[to].muxer.addExternalOutput(externalOutput, url);
-            externalOutputs[url] = externalOutput;
-        }
-    };
-
-    that.removeExternalOutput = function (to, url) {
-      if (externalOutputs[url] !== undefined && publishers[to] !== undefined) {
-        log.info("Stopping ExternalOutput: url " + url);
-        publishers[to].muxer.removeSubscriber(url);
-        delete externalOutputs[url];
+    return closePromise.then(() => {
+      const client = clients.get(clientId);
+      if (client === undefined) {
+        log.debug('message: trying to close node with no associated client,' +
+          `clientId: ${clientId}, streamId: ${node.streamId}`);
+        return;
       }
-    };
+      const remainingConnections = client.maybeCloseConnection(connection.id);
+      if (remainingConnections === 0) {
+        log.debug(`message: Client is empty, clientId: ${client.id}`);
+      }
+    });
+  };
 
-    that.processSignaling = function (streamId, peerId, msg) {
-        log.info("Process Signaling message: ", streamId, peerId, msg);
-        if (publishers[streamId] !== undefined) {
+  // RemoveClient does not imply deleting the data structures of publishers and subscribers
+  // we rely on erizoController to remove the publishers and subscribers and then call removeClient
+  that.removeClient = (clientId, callback) => {
+    log.info(`message: requested removeClient, clientId: ${clientId}`);
+    const client = clients.get(clientId);
+    if (client === undefined) {
+      log.info(`message: removeClient - client is not present in this ErizoJS, clientId: ${clientId}`);
+      callback('callback', false);
+      return;
+    }
 
-            if (subscribers[streamId][peerId]) {
-                if (msg.type === 'offer') {
-                    subscribers[streamId][peerId].setRemoteSdp(msg.sdp);
-                } else if (msg.type === 'candidate') {
-                    subscribers[streamId][peerId].addRemoteCandidate(msg.candidate.sdpMid, msg.candidate.sdpMLineIndex , msg.candidate.candidate);
-                } 
-            } else {
-                if (msg.type === 'offer') {
-                    publishers[streamId].wrtc.setRemoteSdp(msg.sdp);
-                } else if (msg.type === 'candidate') {
-                    publishers[streamId].wrtc.addRemoteCandidate(msg.candidate.sdpMid, msg.candidate.sdpMLineIndex, msg.candidate.candidate);
-                } 
-            }
-            
-        }
-    };
+    log.info(`message: removeClient = closing all connections on, clientId: ${clientId}`);
+    client.closeAllConnections();
+    clients.delete(client.id);
+    callback('callback', true);
+    if (clients.size === 0) {
+      log.info('message: Removed all clients. Process will exit');
+      process.exit(0);
+    }
+  };
 
-    /*
-     * Adds a publisher to the room. This creates a new OneToManyProcessor
-     * and a new WebRtcConnection. This WebRtcConnection will be the publisher
-     * of the OneToManyProcessor.
-     */
-    that.addPublisher = function (from, callback) {
+  that.rovMessage = (args, callback) => {
+    replManager.processRpcMessage(args, callback);
+  };
 
-        if (publishers[from] === undefined) {
+  that.addExternalInput = (erizoControllerId, streamId, url, label, callbackRpc) => {
+    updateUptimeInfo();
+    if (publishers[streamId] === undefined) {
+      const client = getOrCreateClient(erizoControllerId, url);
+      publishers[streamId] = new ExternalInput(url, streamId, label, threadPool);
+      const ei = publishers[streamId];
+      const answer = ei.init();
+      // We add the connection manually to the client
+      client.addConnection(ei);
+      if (answer >= 0) {
+        callbackRpc('callback', 'success');
+      } else {
+        callbackRpc('callback', answer);
+      }
+    } else {
+      log.warn(`message: Publisher already set, code: ${WARN_CONFLICT}, ` +
+        `streamId: ${streamId}`);
+    }
+  };
 
-            log.info("Adding publisher peer_id ", from);
+  that.addExternalOutput = (streamId, url, options) => {
+    updateUptimeInfo();
+    if (publishers[streamId]) publishers[streamId].addExternalOutput(url, options);
+  };
 
-            var muxer = new addon.OneToManyProcessor(),
-                wrtc = new addon.WebRtcConnection(true, true, GLOBAL.config.erizo.stunserver, GLOBAL.config.erizo.stunport, GLOBAL.config.erizo.minport, GLOBAL.config.erizo.maxport,false);
+  that.removeExternalOutput = (streamId, url) => {
+    if (publishers[streamId] !== undefined) {
+      log.info('message: Stopping ExternalOutput, ' +
+        `id: ${publishers[streamId].getExternalOutput(url).id}`);
+      publishers[streamId].removeExternalOutput(url);
+    }
+  };
 
-            publishers[from] = {muxer: muxer, wrtc: wrtc};
-            subscribers[from] = {};
+  that.processConnectionMessage = (erizoControllerId, clientId, connectionId, msg,
+      callbackRpc = () => {}) => {
+    log.info('message: Process Connection message, ' +
+      `clientId: ${clientId}, connectionId: ${connectionId}`);
+    let error;
+    const client = clients.get(clientId);
+    if (!client) {
+      log.warn('message: Process Connection message to unknown clientId, ' +
+        `clientId: ${clientId}, connectionId: ${connectionId}`);
+      error = 'client-not-found';
+    }
 
-            wrtc.setAudioReceiver(muxer);
-            wrtc.setVideoReceiver(muxer);
-            muxer.setPublisher(wrtc);
+    const connection = client.getConnection(connectionId);
+    if (!connection) {
+      log.warn('message: Process Connection message to unknown connectionId, ' +
+        `clientId: ${clientId}, connectionId: ${connectionId}`);
+      error = 'connection-not-found';
+    }
 
-            initWebRtcConnection(wrtc, callback, from);
+    if (error) {
+      callbackRpc('callback', { error });
+      return Promise.resolve();
+    }
 
-            //log.info('Publishers: ', publishers);
-            //log.info('Subscribers: ', subscribers);
+    if (msg.type === 'failed') {
+      client.forceCloseConnection(connectionId);
+    }
 
+    return connection.onSignalingMessage(msg).then(() => {
+      callbackRpc('callback', {});
+    });
+  };
+
+  that.processStreamMessage = (erizoControllerId, clientId, streamId, msg) => {
+    log.info('message: Process Stream message, ' +
+      `clientId: ${clientId}, streamId: ${streamId}`);
+
+    let node;
+    const publisher = publishers[streamId];
+    if (!publisher) {
+      log.warn('message: Process Stream message stream not found, ' +
+        `clientId: ${clientId}, streamId: ${streamId}`);
+      return;
+    }
+
+    if (publisher.clientId === clientId) {
+      node = publisher;
+    } else if (publisher.hasSubscriber(clientId)) {
+      node = publisher.getSubscriber(clientId);
+    } else {
+      log.warn('message: Process Stream message stream not found, ' +
+        `clientId: ${clientId}, streamId: ${streamId}`);
+      return;
+    }
+    node.onStreamMessage(msg);
+  };
+
+  /*
+   * Adds a publisher to the room. This creates a new OneToManyProcessor
+   * and a new WebRtcConnection. This WebRtcConnection will be the publisher
+   * of the OneToManyProcessor.
+   */
+  that.addPublisher = (erizoControllerId, clientId, streamId, options, callbackRpc) => {
+    updateUptimeInfo();
+    let publisher;
+    log.info('addPublisher, clientId', clientId, 'streamId', streamId);
+    const client = getOrCreateClient(erizoControllerId, clientId, options.singlePC);
+
+    if (publishers[streamId] === undefined) {
+      // eslint-disable-next-line no-param-reassign
+      options.publicIP = that.publicIP;
+      // eslint-disable-next-line no-param-reassign
+      options.privateRegexp = that.privateRegexp;
+      const connection = client.getOrCreateConnection(options);
+      log.info('message: Adding publisher, ' +
+        `clientId: ${clientId}, ` +
+        `streamId: ${streamId}`,
+        logger.objectToLog(options),
+        logger.objectToLog(options.metadata));
+      publisher = new Publisher(clientId, streamId, connection, options);
+      publishers[streamId] = publisher;
+      publisher.initMediaStream();
+      publisher.on('callback', onAdaptSchemeNotify.bind(this, callbackRpc));
+      publisher.on('periodic_stats', onPeriodicStats.bind(this, streamId, undefined));
+      publisher.promise.then(() => {
+        connection.init(options.createOffer);
+      });
+      connection.onInitialized.then(() => {
+        callbackRpc('callback', { type: 'initializing', connectionId: connection.id });
+      });
+      connection.onReady.then(() => {
+        callbackRpc('callback', { type: 'ready' });
+      });
+      connection.onStarted.then(() => {
+        callbackRpc('callback', { type: 'started' });
+      });
+      if (options.createOffer) {
+        let onEvent;
+        if (options.trickleIce) {
+          onEvent = connection.onInitialized;
         } else {
-            log.info("Publisher already set for", from);
+          onEvent = connection.onGathered;
         }
+        onEvent.then(() => {
+          connection.sendOffer();
+        });
+      }
+    } else {
+      publisher = publishers[streamId];
+      if (publisher.numSubscribers === 0) {
+        log.warn('message: publisher already set but no subscribers will ignore, ' +
+          `code: ${WARN_CONFLICT}, streamId: ${streamId}`,
+          logger.objectToLog(options.metadata));
+      } else {
+        log.warn('message: publisher already set has subscribers will ignore, ' +
+          `code: ${WARN_CONFLICT}, streamId: ${streamId}`);
+      }
+    }
+  };
+
+  /*
+   * Adds a subscriber to the room. This creates a new WebRtcConnection.
+   * This WebRtcConnection will be added to the subscribers list of the
+   * OneToManyProcessor.
+   */
+  that.addSubscriber = (erizoControllerId, clientId, streamId, options, callbackRpc) => {
+    updateUptimeInfo();
+    const publisher = publishers[streamId];
+    if (publisher === undefined) {
+      log.warn('message: addSubscriber to unknown publisher, ' +
+        `code: ${WARN_NOT_FOUND}, streamId: ${streamId}, ` +
+        `clientId: ${clientId}`,
+        logger.objectToLog(options.metadata));
+      // We may need to notify the clients
+      return;
+    }
+    let subscriber = publisher.getSubscriber(clientId);
+    const client = getOrCreateClient(erizoControllerId, clientId, options.singlePC);
+    if (subscriber !== undefined) {
+      log.warn('message: Duplicated subscription will resubscribe, ' +
+        `code: ${WARN_CONFLICT}, streamId: ${streamId}, ` +
+        `clientId: ${clientId}`, logger.objectToLog(options.metadata));
+      that.removeSubscriber(clientId, streamId);
+    }
+    // eslint-disable-next-line no-param-reassign
+    options.publicIP = that.publicIP;
+    // eslint-disable-next-line no-param-reassign
+    options.privateRegexp = that.privateRegexp;
+    const connection = client.getOrCreateConnection(options);
+    // eslint-disable-next-line no-param-reassign
+    options.label = publisher.label;
+    subscriber = publisher.addSubscriber(clientId, connection, options);
+    subscriber.initMediaStream();
+    subscriber.on('callback', onAdaptSchemeNotify.bind(this, callbackRpc, 'callback'));
+    subscriber.on('periodic_stats', onPeriodicStats.bind(this, clientId, streamId));
+
+    subscriber.promise.then(() => {
+      connection.init(options.createOffer);
+    });
+
+    connection.onInitialized.then(() => {
+      callbackRpc('callback', { type: 'initializing', connectionId: connection.id });
+    });
+    connection.onReady.then(() => {
+      callbackRpc('callback', { type: 'ready' });
+    });
+    connection.onStarted.then(() => {
+      callbackRpc('callback', { type: 'started' });
+    });
+    if (options.createOffer) {
+      let onEvent;
+      if (options.trickleIce) {
+        onEvent = connection.onInitialized;
+      } else {
+        onEvent = connection.onGathered;
+      }
+      onEvent.then(() => {
+        connection.sendOffer();
+      });
+    }
+  };
+
+  /*
+   * Adds multiple subscribers to the room.
+   */
+  that.addMultipleSubscribers = (erizoControllerId, clientId, streamIds, options, callbackRpc) => {
+    if (!options.singlePC) {
+      log.warn('message: addMultipleSubscribers not compatible with no single PC, clientId:', clientId);
+      callbackRpc('callback', { type: 'error' });
+      return;
+    }
+
+    const knownPublishers = streamIds.map(streamId => publishers[streamId])
+                                     .filter(pub =>
+                                       pub !== undefined &&
+                                        !pub.getSubscriber(clientId));
+    if (knownPublishers.length === 0) {
+      log.warn('message: addMultipleSubscribers to unknown publisher, ' +
+        `code: ${WARN_NOT_FOUND}, streamIds: ${streamIds}, ` +
+        `clientId: ${clientId}`,
+        logger.objectToLog(options.metadata));
+      callbackRpc('callback', { type: 'error' });
+      return;
+    }
+
+    log.debug('message: addMultipleSubscribers to publishers, ' +
+        `streamIds: ${knownPublishers}, ` +
+        `clientId: ${clientId}`,
+        logger.objectToLog(options.metadata));
+
+    const client = getOrCreateClient(erizoControllerId, clientId, options.singlePC);
+    // eslint-disable-next-line no-param-reassign
+    options.publicIP = that.publicIP;
+    // eslint-disable-next-line no-param-reassign
+    options.privateRegexp = that.privateRegexp;
+    const connection = client.getOrCreateConnection(options);
+    const promises = [];
+    knownPublishers.forEach((publisher) => {
+      const streamId = publisher.streamId;
+      // eslint-disable-next-line no-param-reassign
+      options.label = publisher.label;
+      const subscriber = publisher.addSubscriber(clientId, connection, options);
+      subscriber.initMediaStream(true);
+      subscriber.copySdpInfoFromPublisher();
+      promises.push(subscriber.promise);
+      subscriber.on('callback', onAdaptSchemeNotify.bind(this, callbackRpc, 'callback'));
+      subscriber.on('periodic_stats', onPeriodicStats.bind(this, clientId, streamId));
+    });
+
+    const knownStreamIds = knownPublishers.map(pub => pub.streamId);
+
+    const constraints = {
+      audio: true,
+      video: true,
+      bundle: true,
     };
 
-    /*
-     * Adds a subscriber to the room. This creates a new WebRtcConnection.
-     * This WebRtcConnection will be added to the subscribers list of the
-     * OneToManyProcessor.
-     */
-    that.addSubscriber = function (from, to, options, callback) {
-
-        if (publishers[to] !== undefined && subscribers[to][from] === undefined) {
-
-            log.info("Adding subscriber from ", from, 'to ', to, 'audio', options.audio, 'video', options.video);
-
-            var wrtc = new addon.WebRtcConnection(options.audio, options.video, GLOBAL.config.erizo.stunserver, GLOBAL.config.erizo.stunport, GLOBAL.config.erizo.minport, GLOBAL.config.erizo.maxport,false);
-
-            subscribers[to][from] = wrtc;
-            publishers[to].muxer.addSubscriber(wrtc, from);
-
-            initWebRtcConnection(wrtc, callback, to, from, options.browser);
-
-            //log.info('Publishers: ', publishers);
-            //log.info('Subscribers: ', subscribers);
-        }
-    };
+    connection.init(constraints);
+    promises.push(connection.createOfferPromise);
+    Promise.all(promises)
+      .then(() => {
+        log.debug('message: autoSubscription waiting for gathering event', connection.alreadyGathered, connection.onGathered);
+        return connection.onGathered;
+      })
+      .then(() => {
+        callbackRpc('callback', { type: 'multiple-initializing', connectionId: connection.id, streamIds: knownStreamIds, context: 'auto-streams-subscription', options });
+        connection.sendOffer();
+      });
+  };
 
     /*
-     * Removes a publisher from the room. This also deletes the associated OneToManyProcessor.
-     */
-    that.removePublisher = function (from) {
+   * Removes multiple subscribers from the room.
+   */
+  that.removeMultipleSubscribers = (clientId, streamIds, callbackRpc) => {
+    const knownPublishers = streamIds.map(streamId => publishers[streamId])
+                                     .filter(pub =>
+                                       pub !== undefined &&
+                                        pub.getSubscriber(clientId));
+    if (knownPublishers.length === 0) {
+      log.warn('message: removeMultipleSubscribers from unknown publisher, ' +
+        `code: ${WARN_NOT_FOUND}, streamIds: ${streamIds}, ` +
+        `clientId: ${clientId}`);
+      callbackRpc('callback', { type: 'error' });
+      return;
+    }
 
-        if (subscribers[from] !== undefined && publishers[from] !== undefined) {
-            log.info('Removing muxer', from);
-            for (var key in subscribers[from]) {
-              if (subscribers[from].hasOwnProperty(key)){
-                log.info("Iterating and closing ", key,  subscribers[from], subscribers[from][key]);
-                subscribers[from][key].close();
+    log.debug('message: removeMultipleSubscribers from publishers, ' +
+        `streamIds: ${knownPublishers}, ` +
+        `clientId: ${clientId}`);
+
+    const client = clients.get(clientId);
+    if (!client) {
+      callbackRpc('callback', { type: 'error' });
+    }
+
+    let connection;
+
+    const promises = [];
+    knownPublishers.forEach((publisher) => {
+      if (publisher && publisher.hasSubscriber(clientId)) {
+        const subscriber = publisher.getSubscriber(clientId);
+        connection = subscriber.connection;
+        promises.push(closeNode(subscriber, false));
+        publisher.removeSubscriber(clientId);
+      }
+    });
+
+    const knownStreamIds = knownPublishers.map(pub => pub.streamId);
+
+    Promise.all(promises)
+      .then(() => connection.onGathered)
+      .then(() => {
+        callbackRpc('callback', {
+          type: 'multiple-removal',
+          connectionId: connection.id,
+          streamIds: knownStreamIds,
+          context: 'auto-streams-unsubscription' });
+        connection.sendOffer();
+      });
+  };
+
+  /*
+   * Removes a publisher from the room. This also deletes the associated OneToManyProcessor.
+   */
+  that.removePublisher = (clientId, streamId, callback = () => {}) =>
+    new Promise((resolve) => {
+      const publisher = publishers[streamId];
+      if (publisher !== undefined) {
+        log.info(`message: Removing publisher, id: ${clientId}, streamId: ${streamId}`);
+        publisher.forEachSubscriber((subscriberId, subscriber) => {
+          log.info(`message: Removing subscriber, id: ${subscriberId}`);
+          closeNode(subscriber);
+          publisher.removeSubscriber(subscriberId);
+        });
+        publisher.removeExternalOutputs().then(() => {
+          delete publishers[streamId];
+          closeNode(publisher).then(() => {
+            publisher.muxer.close((message) => {
+              log.info('message: muxer closed succesfully, ' +
+                `id: ${streamId}`,
+                logger.objectToLog(message));
+              const count = Object.keys(publishers).length;
+              log.debug(`message: remaining publishers, publisherCount: ${count}`);
+              callback('callback', true);
+              resolve();
+              if (count === 0) {
+                log.info('message: Removed all publishers. Process is empty.');
               }
-            }
-            publishers[from].wrtc.close();
-            publishers[from].muxer.close();
-            log.info('Removing subscribers', from);
-                
-            delete subscribers[from];
-            log.info('Removing publisher', from);
-            delete publishers[from];
-            var count = 0;
-            for (var k in publishers) {
-                if (publishers.hasOwnProperty(k)) {
-                   ++count;
-                }
-            }
-            log.info("Publishers: ", count);
-            if (count === 0)  {
-                log.info('Removed all publishers. Killing process.');
-                process.exit(0);
-            }
+            });
+          });
+        });
+      } else {
+        log.warn('message: removePublisher that does not exist, ' +
+          `code: ${WARN_NOT_FOUND}, id: ${streamId}`);
+        resolve();
+      }
+    });
+
+  /*
+   * Removes a subscriber from the room.
+   * This also removes it from the associated OneToManyProcessor.
+   */
+  that.removeSubscriber = (clientId, streamId, callback = () => {}) => {
+    const publisher = publishers[streamId];
+    if (publisher && publisher.hasSubscriber(clientId)) {
+      const subscriber = publisher.getSubscriber(clientId);
+      log.info(`message: removing subscriber, streamId: ${subscriber.streamId}, ` +
+        `clientId: ${clientId}`);
+      return closeNode(subscriber).then(() => {
+        publisher.removeSubscriber(clientId);
+        log.info(`message: subscriber node Closed, streamId: ${subscriber.streamId}`);
+        callback('callback', true);
+      });
+    }
+    log.warn(`message: removeSubscriber no publisher has this subscriber, clientId: ${clientId}, streamId: ${streamId}`);
+    callback('callback', true);
+    return Promise.resolve();
+  };
+
+  /*
+   * Removes all the subscribers related with a client.
+   */
+  that.removeSubscriptions = (clientId) => {
+    log.info('message: removing subscriptions, clientId:', clientId);
+    // we go through all the connections in the client and we close them
+    const closePromises = [];
+    forEachPublisher((publisherId, publisher) => {
+      const subscriber = publisher.getSubscriber(clientId);
+      if (subscriber) {
+        log.debug('message: removing subscription, ' +
+          'id:', subscriber.clientId);
+        closePromises.push(closeNode(subscriber));
+        publisher.removeSubscriber(clientId);
+      }
+    });
+    return Promise.all(closePromises);
+  };
+
+  that.getStreamStats = (streamId, callbackRpc) => {
+    const stats = {};
+    let publisher;
+    log.debug(`message: Requested stream stats, streamID: ${streamId}`);
+    const promises = [];
+    if (streamId && publishers[streamId]) {
+      publisher = publishers[streamId];
+      promises.push(publisher.getStats('publisher', stats));
+
+      publisher.forEachSubscriber((subscriberId, subscriber) => {
+        promises.push(
+          subscriber.getStats(
+            subscriberId,
+            stats));
+      });
+      Promise.all(promises).then(() => {
+        callbackRpc('callback', stats);
+      });
+    }
+  };
+
+  that.subscribeToStats = (streamId, timeout, interval, callbackRpc) => {
+    let publisher;
+    log.debug(`message: Requested subscription to stream stats, streamId: ${streamId}`);
+
+    if (streamId && publishers[streamId]) {
+      publisher = publishers[streamId];
+
+      if (global.config.erizoController.reportSubscriptions &&
+          global.config.erizoController.reportSubscriptions.maxSubscriptions > 0) {
+        if (timeout > global.config.erizoController.reportSubscriptions.maxTimeout) {
+          // eslint-disable-next-line no-param-reassign
+          timeout = global.config.erizoController.reportSubscriptions.maxTimeout;
         }
-    };
-
-    /*
-     * Removes a subscriber from the room. This also removes it from the associated OneToManyProcessor.
-     */
-    that.removeSubscriber = function (from, to) {
-
-        if (subscribers[to][from]) {
-            log.info('Removing subscriber ', from, 'to muxer ', to);
-            subscribers[to][from].close();
-            publishers[to].muxer.removeSubscriber(from);
-            delete subscribers[to][from];
+        if (interval < global.config.erizoController.reportSubscriptions.minInterval) {
+          // eslint-disable-next-line no-param-reassign
+          interval = global.config.erizoController.reportSubscriptions.minInterval;
         }
-    };
-
-    /*
-     * Removes all the subscribers related with a client.
-     */
-    that.removeSubscriptions = function (from) {
-
-        var key;
-
-        log.info('Removing subscriptions of ', from);
-        for (key in subscribers) {
-            if (subscribers.hasOwnProperty(key)) {
-                 if (subscribers[to][from]) {
-                    log.info('Removing subscriber ', from, 'to muxer ', key);
-                    publishers[key].muxer.removeSubscriber(from);
-                    delete subscribers[key][from];
-                }
-            }
+        if (statsSubscriptions[streamId]) {
+          log.debug(`message: Renewing subscription to stream: ${streamId}`);
+          clearTimeout(statsSubscriptions[streamId].timeout);
+          clearInterval(statsSubscriptions[streamId].interval);
+        } else if (Object.keys(statsSubscriptions).length <
+            global.config.erizoController.reportSubscriptions.maxSubscriptions) {
+          statsSubscriptions[streamId] = {};
         }
-    };
 
-    return that;
+        if (!statsSubscriptions[streamId]) {
+          log.debug('message: Max Subscriptions limit reached, ignoring message');
+          return;
+        }
+
+        statsSubscriptions[streamId].interval = setInterval(() => {
+          const promises = [];
+          const stats = {};
+
+          stats.streamId = streamId;
+          promises.push(publisher.getStats('publisher', stats));
+          publisher.forEachSubscriber((subscriberId, subscriber) => {
+            promises.push(subscriber.getStats(subscriberId, stats));
+          });
+          Promise.all(promises).then(() => {
+            amqper.broadcast('stats_subscriptions', stats);
+          });
+        }, interval * 1000);
+
+        statsSubscriptions[streamId].timeout = setTimeout(() => {
+          clearInterval(statsSubscriptions[streamId].interval);
+          delete statsSubscriptions[streamId];
+        }, timeout * 1000);
+
+        callbackRpc('success');
+      } else {
+        log.debug('message: Report subscriptions disabled by config, ignoring message');
+      }
+    } else {
+      log.debug(`message: stream not found - ignoring message, streamId: ${streamId}`);
+    }
+  };
+
+  that.getAndResetMetrics = () => {
+    const metrics = Object.assign({}, that.metrics);
+    metrics.totalConnections = 0;
+    metrics.connectionLevels = Array(10).fill(0);
+    metrics.publishers = Object.keys(that.publishers).length;
+    let subscribers = 0;
+    Object.keys(that.publishers).forEach((streamId) => {
+      const publisher = that.publishers[streamId];
+      subscribers += publisher.numSubscribers;
+    });
+    metrics.subscribers = subscribers;
+
+    metrics.durationDistribution = threadPool.getDurationDistribution();
+    threadPool.resetStats();
+
+    clients.forEach((client) => {
+      const connections = client.getConnections();
+      metrics.totalConnections += connections.length;
+
+      connections.forEach((connection) => {
+        const level = connection.qualityLevel;
+        if (level >= 0 && level < metrics.connectionLevels.length) {
+          metrics.connectionLevels[level] += 1;
+        }
+      });
+    });
+    initMetrics();
+    return metrics;
+  };
+
+  return that;
 };

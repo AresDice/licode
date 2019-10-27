@@ -1,176 +1,274 @@
-#ifndef WEBRTCCONNECTION_H_
-#define WEBRTCCONNECTION_H_
+#ifndef ERIZO_SRC_ERIZO_WEBRTCCONNECTION_H_
+#define ERIZO_SRC_ERIZO_WEBRTCCONNECTION_H_
+
+#include <boost/thread.hpp>
+#include <boost/thread/future.hpp>
+#include <boost/thread/mutex.hpp>
 
 #include <string>
-#include <queue>
-#include <boost/thread/mutex.hpp>
-#include <boost/thread.hpp>
+#include <map>
+#include <vector>
 
-#include "logger.h"
-#include "SdpInfo.h"
-#include "MediaDefinitions.h"
-#include "Transport.h"
-#include "Stats.h"
-#include "rtp/webrtc/fec_receiver_impl.h"
+#include "./logger.h"
+#include "./SdpInfo.h"
+#include "./MediaDefinitions.h"
+#include "./Transport.h"
+#include "./Stats.h"
+#include "bandwidth/BandwidthDistributionAlgorithm.h"
+#include "bandwidth/ConnectionQualityCheck.h"
+#include "pipeline/Pipeline.h"
+#include "thread/Worker.h"
+#include "thread/IOWorker.h"
+#include "rtp/RtcpProcessor.h"
+#include "rtp/RtpExtensionProcessor.h"
+#include "lib/Clock.h"
+#include "pipeline/Handler.h"
+#include "pipeline/HandlerManager.h"
+#include "pipeline/Service.h"
+#include "rtp/PacketBufferService.h"
 
 namespace erizo {
 
+constexpr std::chrono::milliseconds kBitrateControlPeriod(100);
+constexpr uint32_t kDefaultVideoSinkSSRC = 55543;
+constexpr uint32_t kDefaultAudioSinkSSRC = 44444;
+
 class Transport;
 class TransportListener;
+class IceConfig;
+class MediaStream;
 
 /**
  * WebRTC Events
  */
 enum WebRTCEvent {
-  CONN_INITIAL = 101, CONN_STARTED = 102,CONN_GATHERED = 103, CONN_READY = 104, CONN_FINISHED = 105, CONN_CANDIDATE = 201, CONN_SDP = 202,
+  CONN_INITIAL = 101, CONN_STARTED = 102, CONN_GATHERED = 103, CONN_READY = 104, CONN_FINISHED = 105,
+  CONN_CANDIDATE = 201, CONN_SDP = 202, CONN_SDP_PROCESSED = 203,
   CONN_FAILED = 500
 };
 
 class WebRtcConnectionEventListener {
-public:
+ public:
     virtual ~WebRtcConnectionEventListener() {
     }
-    ;
-    virtual void notifyEvent(WebRTCEvent newEvent, const std::string& message)=0;
-
+    virtual void notifyEvent(WebRTCEvent newEvent, const std::string& message) = 0;
 };
 
-class WebRtcConnectionStatsListener {
-public:
-    virtual ~WebRtcConnectionStatsListener() {
-    }
-    ;
-    virtual void notifyStats(const std::string& message)=0;
-};
 /**
  * A WebRTC Connection. This class represents a WebRTC Connection that can be established with other peers via a SDP negotiation
  * it comprises all the necessary Transport components.
  */
-class WebRtcConnection: public MediaSink, public MediaSource, public FeedbackSink, public FeedbackSource, public TransportListener, public webrtc::RtpData {
-	DECLARE_LOGGER();
-public:
-    /**
-     * Constructor.
-     * Constructs an empty WebRTCConnection without any configuration.
-     */
-    WebRtcConnection(bool audioEnabled, bool videoEnabled, const std::string &stunServer, int stunPort, int minPort, int maxPort,bool trickleEnabled,WebRtcConnectionEventListener* listener);
-    /**
-     * Destructor.
-     */
-    virtual ~WebRtcConnection();
-    /**
-     * Inits the WebConnection by starting ICE Candidate Gathering.
-     * @return True if the candidates are gathered.
-     */
-    bool init();
-    void close();
-    /**
-     * Sets the SDP of the remote peer.
-     * @param sdp The SDP.
-     * @return true if the SDP was received correctly.
-     */
-    bool setRemoteSdp(const std::string &sdp);
+class WebRtcConnection: public TransportListener, public LogContext, public HandlerManagerListener,
+                        public std::enable_shared_from_this<WebRtcConnection>, public Service {
+  DECLARE_LOGGER();
 
-    /**
-     * Add new remote candidate (from remote peer).
-     * @param sdp The candidate in SDP format.
-     * @return true if the SDP was received correctly.
-     */
-    bool addRemoteCandidate(const std::string &mid, int mLineIndex, const std::string &sdp);
-    /**
-     * Obtains the local SDP.
-     * @return The SDP as a string.
-     */
-    std::string getLocalSdp();
+ public:
+  typedef typename Handler::Context Context;
 
-    int deliverAudioData(char* buf, int len);
-    int deliverVideoData(char* buf, int len);
+  /**
+   * Constructor.
+   * Constructs an empty WebRTCConnection without any configuration.
+   */
+  WebRtcConnection(std::shared_ptr<Worker> worker, std::shared_ptr<IOWorker> io_worker,
+      const std::string& connection_id, const IceConfig& ice_config,
+      const std::vector<RtpMap> rtp_mappings, const std::vector<erizo::ExtMap> ext_mappings,
+      bool enable_connection_quality_check, WebRtcConnectionEventListener* listener);
+  /**
+   * Destructor.
+   */
+  virtual ~WebRtcConnection();
+  /**
+   * Inits the WebConnection by starting ICE Candidate Gathering.
+   * @return True if the candidates are gathered.
+   */
+  bool init();
+  void close();
+  void syncClose();
 
-    int deliverFeedback(char* buf, int len);
-  
-    // changes the outgoing payload type for in the given data packet
-    void changeDeliverPayloadType(dataPacket *dp, packetType type);
-    // parses incoming payload type, replaces occurence in buf
-    void parseIncomingPayloadType(char *buf, int len, packetType type);
+  boost::future<void> setRemoteSdpInfo(std::shared_ptr<SdpInfo> sdp);
+  /**
+   * Sets the SDP of the remote peer.
+   * @param sdp The SDP.
+   * @return true if the SDP was received correctly.
+   */
+  boost::future<void> setRemoteSdp(const std::string &sdp);
 
-    /**
-     * Sends a PLI Packet 
-     * @return the size of the data sent
-     */
-    int sendPLI();
-  
+  boost::future<void> createOffer(bool video_enabled, bool audio_enabled, bool bundle);
+
+  boost::future<void> addRemoteCandidate(std::string mid, int mLineIndex, std::string sdp);
+
+  /**
+   * Add new remote candidate (from remote peer).
+   * @param sdp The candidate in SDP format.
+   * @return true if the SDP was received correctly.
+   */
+  bool addRemoteCandidateSync(std::string mid, int mLineIndex, std::string sdp);
+
+  /**
+   * Obtains the local SDP.
+   * @return The SDP as a SdpInfo.
+   */
+  boost::future<std::shared_ptr<SdpInfo>> getLocalSdpInfo();
+  std::shared_ptr<SdpInfo> getLocalSdpInfoSync();
+  /**
+   * Copy some SdpInfo data to local SdpInfo
+   */
+  void copyDataToLocalSdpIndo(std::shared_ptr<SdpInfo> sdp_info);
+  /**
+   * Obtains the local SDP.
+   * @return The SDP as a string.
+   */
+  std::string getLocalSdp();
+
   /**
    * Sets the Event Listener for this WebRtcConnection
    */
+  void setWebRtcConnectionEventListener(WebRtcConnectionEventListener* listener);
 
-    inline void setWebRtcConnectionEventListener(
-            WebRtcConnectionEventListener* listener){
-    this->connEventListener_ = listener;
-  }
-    
   /**
-   * Sets the Stats Listener for this WebRtcConnection
+   * Gets the current state of the Ice Connection
+   * @return
    */
-  inline void setWebRtcConnectionStatsListener(
-            WebRtcConnectionStatsListener* listener){
-    this->thisStats_.setStatsListener(listener);
+  WebRTCEvent getCurrentState();
+
+  void onTransportData(std::shared_ptr<DataPacket> packet, Transport *transport) override;
+
+  void updateState(TransportState state, Transport * transport) override;
+
+  void onCandidate(const CandidateInfo& cand, Transport *transport) override;
+
+  void setMetadata(std::map<std::string, std::string> metadata);
+
+  void send(std::shared_ptr<DataPacket> packet);
+
+  boost::future<void> asyncTask(std::function<void(std::shared_ptr<WebRtcConnection>)> f);
+
+  bool isAudioMuted() { return audio_muted_; }
+  bool isVideoMuted() { return video_muted_; }
+
+  boost::future<void> addMediaStream(std::shared_ptr<MediaStream> media_stream);
+  boost::future<void> removeMediaStream(const std::string& stream_id);
+  void forEachMediaStream(std::function<void(const std::shared_ptr<MediaStream>&)> func);
+  boost::future<void> forEachMediaStreamAsync(std::function<void(const std::shared_ptr<MediaStream>&)> func);
+  void forEachMediaStreamAsyncNoPromise(std::function<void(const std::shared_ptr<MediaStream>&)> func);
+
+  void setTransport(std::shared_ptr<Transport> transport);  // Only for Testing purposes
+
+  std::shared_ptr<Stats> getStatsService() { return stats_; }
+
+  RtpExtensionProcessor& getRtpExtensionProcessor() { return extension_processor_; }
+
+  std::shared_ptr<Worker> getWorker() { return worker_; }
+
+  inline std::string toLog() {
+    return "id: " + connection_id_ + ", " + printLogContext();
   }
-    /**
-     * Gets the current state of the Ice Connection
-     * @return
-     */
-    WebRTCEvent getCurrentState();
-    
-    std::string getJSONStats();
 
-    void onTransportData(char* buf, int len, Transport *transport);
+  bool isPipelineInitialized() { return pipeline_initialized_; }
+  bool isRunning() { return pipeline_initialized_ && sending_; }
+  Pipeline::Ptr getPipeline() { return pipeline_; }
+  void read(std::shared_ptr<DataPacket> packet);
+  void write(std::shared_ptr<DataPacket> packet);
+  void notifyUpdateToHandlers() override;
+  ConnectionQualityLevel getConnectionQualityLevel();
+  bool werePacketLossesRecently();
+  void getJSONStats(std::function<void(std::string)> callback);
 
-    void updateState(TransportState state, Transport * transport);
-
-    void queueData(int comp, const char* data, int len, Transport *transport, packetType type);
-
-    void onCandidate(const CandidateInfo& cand, Transport *transport);
-
-
-    // webrtc::RtpHeader overrides.
-    int32_t OnReceivedPayloadData(const uint8_t* payloadData, const uint16_t payloadSize,const webrtc::WebRtcRTPHeader* rtpHeader);
-    bool OnRecoveredPacket(const uint8_t* packet, int packet_length);
-
-private:
-  static const int STATS_INTERVAL = 5000;
-    SdpInfo remoteSdp_;
-    SdpInfo localSdp_;
-
-  Stats thisStats_;
-
-	WebRTCEvent globalState_;
-
-  int bundle_, sequenceNumberFIR_;
-  boost::mutex receiveVideoMutex_, updateStateMutex_;
-  boost::thread send_Thread_;
-	std::queue<dataPacket> sendQueue_;
-	WebRtcConnectionEventListener* connEventListener_;
-	Transport *videoTransport_, *audioTransport_;
-
-  bool sending_;
-	void sendLoop();
-	void writeSsrc(char* buf, int len, unsigned int ssrc);
-	int deliverAudioData_(char* buf, int len);
-	int deliverVideoData_(char* buf, int len);
-  int deliverFeedback_(char* buf, int len);
+ private:
+  bool createOfferSync(bool video_enabled, bool audio_enabled, bool bundle);
+  boost::future<void> processRemoteSdp();
+  boost::future<void> setRemoteSdpsToMediaStreams();
   std::string getJSONCandidate(const std::string& mid, const std::string& sdp);
+  void trackTransportInfo();
+  void onRtcpFromTransport(std::shared_ptr<DataPacket> packet, Transport *transport);
+  void onREMBFromTransport(RtcpHeader *chead, Transport *transport);
+  void maybeNotifyWebRtcConnectionEvent(const WebRTCEvent& event, const std::string& message);
+  void initializePipeline();
 
-  
-    bool audioEnabled_;
-    bool videoEnabled_;
-    bool trickleEnabled_;
+ protected:
+  std::atomic<WebRTCEvent> global_state_;
 
-    int stunPort_, minPort_, maxPort_;
-    std::string stunServer_;
+ private:
+  std::string connection_id_;
+  bool audio_enabled_;
+  bool video_enabled_;
+  bool trickle_enabled_;
+  bool slide_show_mode_;
+  bool sending_;
+  int bundle_;
+  WebRtcConnectionEventListener* conn_event_listener_;
+  IceConfig ice_config_;
+  std::vector<RtpMap> rtp_mappings_;
+  RtpExtensionProcessor extension_processor_;
+  boost::condition_variable cond_;
 
-	boost::condition_variable cond_;
-  webrtc::FecReceiverImpl fec_receiver_;
+  std::shared_ptr<Transport> video_transport_, audio_transport_;
+
+  std::shared_ptr<Stats> stats_;
+
+  boost::mutex update_state_mutex_;
+  boost::mutex event_listener_mutex_;
+
+  std::shared_ptr<Worker> worker_;
+  std::shared_ptr<IOWorker> io_worker_;
+  std::vector<std::shared_ptr<MediaStream>> media_streams_;
+  std::shared_ptr<SdpInfo> remote_sdp_;
+  std::shared_ptr<SdpInfo> local_sdp_;
+  bool audio_muted_;
+  bool video_muted_;
+  bool first_remote_sdp_processed_;
+
+  std::unique_ptr<BandwidthDistributionAlgorithm> distributor_;
+  ConnectionQualityCheck connection_quality_check_;
+  bool enable_connection_quality_check_;
+  Pipeline::Ptr pipeline_;
+  bool pipeline_initialized_;
+  std::shared_ptr<HandlerManager> handler_manager_;
 };
 
-} /* namespace erizo */
-#endif /* WEBRTCCONNECTION_H_ */
+class ConnectionPacketReader : public InboundHandler {
+ public:
+  explicit ConnectionPacketReader(WebRtcConnection *connection) : connection_{connection} {}
+
+  void enable() override {}
+  void disable() override {}
+
+  std::string getName() override {
+    return "connection-reader";
+  }
+
+  void read(Context *ctx, std::shared_ptr<DataPacket> packet) override {
+    connection_->read(std::move(packet));
+  }
+
+  void notifyUpdate() override {
+  }
+
+ private:
+  WebRtcConnection *connection_;
+};
+
+class ConnectionPacketWriter : public OutboundHandler {
+ public:
+  explicit ConnectionPacketWriter(WebRtcConnection *connection) : connection_{connection} {}
+
+  void enable() override {}
+  void disable() override {}
+
+  std::string getName() override {
+    return "connection-writer";
+  }
+
+  void write(Context *ctx, std::shared_ptr<DataPacket> packet) override {
+    connection_->write(std::move(packet));
+  }
+
+  void notifyUpdate() override {
+  }
+
+ private:
+  WebRtcConnection *connection_;
+};
+
+}  // namespace erizo
+#endif  // ERIZO_SRC_ERIZO_WEBRTCCONNECTION_H_

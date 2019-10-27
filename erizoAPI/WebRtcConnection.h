@@ -1,11 +1,34 @@
-#ifndef WEBRTCCONNECTION_H
-#define WEBRTCCONNECTION_H
+#ifndef ERIZOAPI_WEBRTCCONNECTION_H_
+#define ERIZOAPI_WEBRTCCONNECTION_H_
 
-#include <node.h>
+#include <nan.h>
 #include <WebRtcConnection.h>
+#include <logger.h>
+#include <boost/variant.hpp>
+#include "FuturesManager.h"
 #include "MediaDefinitions.h"
 #include "OneToManyProcessor.h"
+#include "ConnectionDescription.h"
 
+#include <queue>
+#include <string>
+#include <future>  // NOLINT
+
+typedef boost::variant<std::string, std::shared_ptr<erizo::SdpInfo>> ResultVariant;
+typedef std::pair<Nan::Persistent<v8::Promise::Resolver> *, ResultVariant> ResultPair;
+
+class ConnectionStatCallWorker : public Nan::AsyncWorker {
+ public:
+  ConnectionStatCallWorker(Nan::Callback *callback, std::weak_ptr<erizo::WebRtcConnection> weak_connection);
+
+  void Execute();
+
+  void HandleOKCallback();
+
+ private:
+  std::weak_ptr<erizo::WebRtcConnection> weak_connection_;
+  std::string stat_;
+};
 
 /*
  * Wrapper class of erizo::WebRtcConnection
@@ -13,85 +36,114 @@
  * A WebRTC Connection. This class represents a WebRtcConnection that can be established with other peers via a SDP negotiation
  * it comprises all the necessary ICE and SRTP components.
  */
-class WebRtcConnection : public node::ObjectWrap, erizo::WebRtcConnectionEventListener, erizo::WebRtcConnectionStatsListener  {
+class WebRtcConnection : public erizo::WebRtcConnectionEventListener,
+   public Nan::ObjectWrap{
  public:
-  static void Init(v8::Handle<v8::Object> target);
+    DECLARE_LOGGER();
+    static NAN_MODULE_INIT(Init);
 
-  erizo::WebRtcConnection *me;
-  int eventSt;
-  std::queue<int> eventSts;
-  std::queue<std::string> eventMsgs;
-  std::string statsMsg;
-  boost::mutex mutex;
+    std::shared_ptr<erizo::WebRtcConnection> me;
+    std::queue<int> event_status;
+    std::queue<std::string> event_messages;
+    std::queue<ResultPair> futures;
+    FuturesManager futures_manager_;
+
+    boost::mutex mutex;
 
  private:
-  WebRtcConnection();
-  ~WebRtcConnection();
-  
-  v8::Persistent<v8::Function> eventCallback_;
-  v8::Persistent<v8::Function> statsCallback_;
+    WebRtcConnection();
+    ~WebRtcConnection();
 
-  uv_async_t async_;
-  uv_async_t asyncStats_;
-  bool hasCallback_;
-  /*
-   * Constructor.
-   * Constructs an empty WebRtcConnection without any configuration.
-   */
-  static v8::Handle<v8::Value> New(const v8::Arguments& args);
-  /*
-   * Closes the webRTC connection.
-   * The object cannot be used after this call.
-   */
-  static v8::Handle<v8::Value> close(const v8::Arguments& args);
-  /*
-   * Inits the WebRtcConnection and passes the callback to get Events.
-   * Returns true if the candidates are gathered.
-   */
-  static v8::Handle<v8::Value> init(const v8::Arguments& args);  
-  /*
-   * Sets the SDP of the remote peer.
-   * Param: the SDP.
-   * Returns true if the SDP was received correctly.
-   */
-  static v8::Handle<v8::Value> setRemoteSdp(const v8::Arguments& args);
-  /**
+    std::string toLog();
+    void close();
+
+    Nan::Callback *event_callback_;
+    uv_async_t *async_;
+    uv_async_t *future_async_;
+    bool closed_;
+    std::string id_;
+    /*
+     * Constructor.
+     * Constructs an empty WebRtcConnection without any configuration.
+     */
+    static NAN_METHOD(New);
+    /*
+     * Closes the webRTC connection.
+     * The object cannot be used after this call.
+     */
+    static NAN_METHOD(close);
+    /*
+     * Inits the WebRtcConnection and passes the callback to get Events.
+     * Returns true if the candidates are gathered.
+     */
+    static NAN_METHOD(init);
+    /*
+     * Creates an SDP Offer
+     * Param: No params.
+     * Returns true if the process has started successfully.
+     */
+    static NAN_METHOD(createOffer);
+    /*
+     * Sets the SDP of the remote peer.
+     * Param: the SDP.
+     * Returns true if the SDP was received correctly.
+     */
+    static NAN_METHOD(setRemoteDescription);
+    /*
+     * Gets the SDP of the local peer.
+     * Param: the SDP.
+     * Returns true if the SDP was received correctly.
+     */
+    static NAN_METHOD(getLocalDescription);
+    /*
+     * Sets the SDP of the remote peer.
+     * Param: the SDP.
+     * Returns true if the SDP was received correctly.
+     */
+    static NAN_METHOD(setRemoteSdp);
+    /**
      * Add new remote candidate (from remote peer).
      * @param sdp The candidate in SDP format.
      * @return true if the SDP was received correctly.
      */
-  static v8::Handle<v8::Value>  addRemoteCandidate(const v8::Arguments& args);
-  /*
-   * Obtains the local SDP.
-   * Returns the SDP as a string.
-   */
-  static v8::Handle<v8::Value> getLocalSdp(const v8::Arguments& args);
-  /*
-   * Sets a MediaReceiver that is going to receive Audio Data
-   * Param: the MediaReceiver to send audio to.
-   */
-  static v8::Handle<v8::Value> setAudioReceiver(const v8::Arguments& args);
-  /*
-   * Sets a MediaReceiver that is going to receive Video Data
-   * Param: the MediaReceiver
-   */
-  static v8::Handle<v8::Value> setVideoReceiver(const v8::Arguments& args);
-  /*
-   * Gets the current state of the Ice Connection
-   * Returns the state.
-   */
-  static v8::Handle<v8::Value> getCurrentState(const v8::Arguments& args);
+    static NAN_METHOD(addRemoteCandidate);
+    /*
+     * Obtains the local SDP.
+     * Returns the SDP as a string.
+     */
+    static NAN_METHOD(getLocalSdp);
+    /*
+     * Gets the current state of the Ice Connection
+     * Returns the state.
+     */
+    static NAN_METHOD(getCurrentState);
+    /*
+     * Gets the current quality level of the WebRtcConnection
+     * Returns the level.
+     */
+    static NAN_METHOD(getConnectionQualityLevel);
+    /*
+     * Sets Metadata that will be logged in every message
+     * Param: An object with metadata {key1:value1, key2: value2}
+     */
+    static NAN_METHOD(setMetadata);
 
-  static v8::Handle<v8::Value> generatePLIPacket(const v8::Arguments& args);
+    static NAN_METHOD(addMediaStream);
+    static NAN_METHOD(removeMediaStream);
 
+    static NAN_METHOD(copySdpToLocalDescription);
 
-  static v8::Handle<v8::Value> getStats(const v8::Arguments& args);  
+    static NAN_METHOD(getStats);
 
-  static void eventsCallback(uv_async_t *handle, int status);
-  static void statsCallback(uv_async_t *handle, int status);
- 
-	virtual void notifyEvent(erizo::WebRTCEvent event, const std::string& message="");
-	virtual void notifyStats(const std::string& message);
+    static Nan::Persistent<v8::Function> constructor;
+
+    static NAUV_WORK_CB(eventsCallback);
+    static NAUV_WORK_CB(promiseResolver);
+
+    virtual void notifyEvent(erizo::WebRTCEvent event,
+                             const std::string& message = "");
+    virtual void notifyFuture(Nan::Persistent<v8::Promise::Resolver> *persistent,
+        ResultVariant result = ResultVariant());
 };
 
-#endif
+#endif  // ERIZOAPI_WEBRTCCONNECTION_H_
